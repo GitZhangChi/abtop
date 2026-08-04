@@ -1,5 +1,7 @@
 use crate::model::RateLimitInfo;
 use serde::Deserialize;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// File written by the StatusLine hook: ~/.claude/abtop-rate-limits.json
@@ -154,6 +156,21 @@ fn expand_abbreviated_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Return a privacy-preserving identity for the Codex account at a config root.
+/// The raw account ID is hashed immediately and never leaves this function.
+pub(crate) fn codex_account_key(config_root: &str) -> Option<u64> {
+    let config_root = expand_abbreviated_home(config_root);
+    let content = std::fs::read_to_string(config_root.join("auth.json")).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let account_id = auth
+        .pointer("/tokens/account_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())?;
+    let mut hasher = DefaultHasher::new();
+    account_id.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
     let content = std::fs::read_to_string(path).ok()?;
     let file: RateLimitFile = serde_json::from_str(&content).ok()?;
@@ -202,5 +219,34 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.ends_with("codex-rate-limits-codex-2001.json"));
         assert!(second.ends_with("codex-rate-limits-codex-3001.json"));
+    }
+
+    #[test]
+    fn codex_account_keys_match_for_shared_auth_accounts() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let third = tempfile::tempdir().unwrap();
+        std::fs::write(
+            first.path().join("auth.json"),
+            r#"{"tokens":{"account_id":"account-a"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            second.path().join("auth.json"),
+            r#"{"tokens":{"account_id":"account-a"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            third.path().join("auth.json"),
+            r#"{"tokens":{"account_id":"account-b"}}"#,
+        )
+        .unwrap();
+
+        let first_key = codex_account_key(first.path().to_str().unwrap());
+        let second_key = codex_account_key(second.path().to_str().unwrap());
+        let third_key = codex_account_key(third.path().to_str().unwrap());
+
+        assert_eq!(first_key, second_key);
+        assert_ne!(first_key, third_key);
     }
 }

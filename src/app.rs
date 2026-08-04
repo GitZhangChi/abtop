@@ -92,6 +92,9 @@ pub struct App {
     pub token_rates: VecDeque<f64>,
     /// Account-level rate limits (Claude, Codex, etc.)
     pub rate_limits: Vec<RateLimitInfo>,
+    /// Config root to privacy-preserving provider account identity. Kept
+    /// outside `RateLimitInfo` so the public snapshot model stays unchanged.
+    quota_account_keys: HashMap<String, u64>,
     /// Per-session previous token totals, keyed by (agent_cli, session_id).
     prev_tokens: HashMap<(String, String), u64>,
     /// Rate limit poll counter (read every 5 ticks = 10s)
@@ -191,6 +194,7 @@ impl App {
             should_quit: false,
             token_rates: VecDeque::with_capacity(GRAPH_HISTORY_LEN),
             rate_limits: Vec::new(),
+            quota_account_keys: HashMap::new(),
             prev_tokens: HashMap::new(),
             rate_limit_counter: 5,
             collector,
@@ -555,11 +559,26 @@ impl App {
             self.rate_limits = read_rate_limits(&extra_dirs);
             // Merge live rate limits from agent collectors (e.g. Codex JSONL parsing)
             self.rate_limits.extend(self.collector.agent_rate_limits());
+            self.quota_account_keys.clear();
+            for limit in &self.rate_limits {
+                if limit.source.eq_ignore_ascii_case("codex") {
+                    if let Some(account_key) =
+                        crate::collector::rate_limit::codex_account_key(&limit.config_root)
+                    {
+                        self.quota_account_keys
+                            .insert(limit.config_root.clone(), account_key);
+                    }
+                }
+            }
         } else {
             self.rate_limit_counter += 1;
         }
 
         promote_waiting_to_rate_limited(&mut self.sessions, &self.rate_limits);
+    }
+
+    pub(crate) fn quota_account_key(&self, config_root: &str) -> Option<u64> {
+        self.quota_account_keys.get(config_root).copied()
     }
 
     /// Drain completed summary results and spawn retries. Does NOT recollect

@@ -76,7 +76,11 @@ pub(crate) fn draw_quota_panel_active(
                 .cmp(&a.updated_at)
                 .then_with(|| a.config_root.cmp(&b.config_root))
         });
-        draw_source_column(f, col_area, source, &limits, &cpu_grad, theme);
+        let display_limits = deduplicate_account_limits(source, &limits, |info| {
+            app.quota_account_key(&info.config_root)
+        });
+        let display_limit_refs: Vec<&RateLimitInfo> = display_limits.iter().collect();
+        draw_source_column(f, col_area, source, &display_limit_refs, &cpu_grad, theme);
     }
 
     // Total tokens summary on last row (full width)
@@ -100,6 +104,59 @@ pub(crate) fn draw_quota_panel_active(
         ])]),
         bottom_area,
     );
+}
+
+fn deduplicate_account_limits<F>(
+    source: &str,
+    limits: &[&RateLimitInfo],
+    account_key: F,
+) -> Vec<RateLimitInfo>
+where
+    F: Fn(&RateLimitInfo) -> Option<u64>,
+{
+    let mut display: Vec<RateLimitInfo> = Vec::new();
+    let mut display_keys: Vec<Option<u64>> = Vec::new();
+
+    for info in limits {
+        let info_key = account_key(info);
+        let duplicate_index = if source.eq_ignore_ascii_case("codex") {
+            info_key.and_then(|key| {
+                display_keys
+                    .iter()
+                    .position(|existing| *existing == Some(key))
+            })
+        } else {
+            None
+        };
+
+        let Some(index) = duplicate_index else {
+            display.push((*info).clone());
+            display_keys.push(info_key);
+            continue;
+        };
+
+        let preferred_root =
+            preferred_profile_root(source, &display[index].config_root, &info.config_root);
+        if info.updated_at > display[index].updated_at {
+            display[index] = (*info).clone();
+        }
+        display[index].config_root = preferred_root;
+    }
+
+    display
+}
+
+fn preferred_profile_root(source: &str, first: &str, second: &str) -> String {
+    let is_default = |root: &str| {
+        std::path::Path::new(root)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(&format!(".{source}")))
+    };
+    match (is_default(first), is_default(second)) {
+        (true, false) => second.to_string(),
+        _ => first.to_string(),
+    }
 }
 
 fn draw_source_column(
@@ -422,6 +479,56 @@ mod tests {
         assert_eq!(account_profile_label("codex", &codex_default), "default");
         assert_eq!(account_profile_label("claude", &claude_alex), "alex");
         assert_eq!(rate_limit_title("codex", &codex_2001), "CODEX · 2001");
+    }
+
+    #[test]
+    fn duplicate_codex_account_prefers_named_profile() {
+        let default = RateLimitInfo {
+            source: "codex".to_string(),
+            config_root: "~/.codex".to_string(),
+            updated_at: Some(20),
+            five_hour_pct: Some(39.0),
+            ..Default::default()
+        };
+        let named = RateLimitInfo {
+            source: "codex".to_string(),
+            config_root: "~/.codex-3001".to_string(),
+            updated_at: Some(10),
+            five_hour_pct: Some(40.0),
+            ..Default::default()
+        };
+
+        let display = deduplicate_account_limits("codex", &[&default, &named], |_| Some(42));
+
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].config_root, "~/.codex-3001");
+        assert_eq!(display[0].five_hour_pct, Some(39.0));
+    }
+
+    #[test]
+    fn equal_quota_values_from_different_accounts_are_not_deduplicated() {
+        let first = RateLimitInfo {
+            source: "codex".to_string(),
+            config_root: "~/.codex-2001".to_string(),
+            five_hour_pct: Some(39.0),
+            ..Default::default()
+        };
+        let second = RateLimitInfo {
+            source: "codex".to_string(),
+            config_root: "~/.codex-3001".to_string(),
+            five_hour_pct: Some(39.0),
+            ..Default::default()
+        };
+
+        let display = deduplicate_account_limits("codex", &[&first, &second], |info| {
+            Some(if info.config_root.ends_with("2001") {
+                1
+            } else {
+                2
+            })
+        });
+
+        assert_eq!(display.len(), 2);
     }
 
     #[test]
