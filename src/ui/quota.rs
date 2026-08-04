@@ -79,6 +79,7 @@ pub(crate) fn draw_quota_panel_active(
         let display_limits = deduplicate_account_limits(source, &limits, |info| {
             app.quota_account_key(&info.config_root)
         });
+        let display_limits = hide_default_profile(source, display_limits);
         let display_limit_refs: Vec<&RateLimitInfo> = display_limits.iter().collect();
         draw_source_column(f, col_area, source, &display_limit_refs, &cpu_grad, theme);
     }
@@ -144,6 +145,25 @@ where
     }
 
     display
+}
+
+/// Drop the bare `~/.claude` / `~/.codex` row once the user has named
+/// profiles configured. That row is the CLI's own default config dir and
+/// almost always mirrors whichever named account was used last, so it
+/// reads as a phantom extra account. Kept when it is the only entry —
+/// users without named profiles still need their quota.
+fn hide_default_profile(source: &str, limits: Vec<RateLimitInfo>) -> Vec<RateLimitInfo> {
+    let named = limits
+        .iter()
+        .filter(|info| account_profile_label(source, info) != "default")
+        .count();
+    if named == 0 {
+        return limits;
+    }
+    limits
+        .into_iter()
+        .filter(|info| account_profile_label(source, info) != "default")
+        .collect()
 }
 
 fn preferred_profile_root(source: &str, first: &str, second: &str) -> String {
@@ -503,6 +523,28 @@ mod tests {
         assert_eq!(display.len(), 1);
         assert_eq!(display[0].config_root, "~/.codex-3001");
         assert_eq!(display[0].five_hour_pct, Some(39.0));
+    }
+
+    #[test]
+    fn default_profile_hidden_only_when_named_profiles_exist() {
+        let default = RateLimitInfo {
+            source: "claude".to_string(),
+            config_root: "~/.claude".to_string(),
+            ..Default::default()
+        };
+        let named = RateLimitInfo {
+            source: "claude".to_string(),
+            config_root: "~/.claude-chi".to_string(),
+            ..Default::default()
+        };
+
+        let kept = hide_default_profile("claude", vec![default.clone()]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].config_root, "~/.claude");
+
+        let filtered = hide_default_profile("claude", vec![default, named]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].config_root, "~/.claude-chi");
     }
 
     #[test]
