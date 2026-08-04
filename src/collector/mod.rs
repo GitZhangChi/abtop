@@ -99,8 +99,8 @@ pub trait AgentCollector {
     fn collect(&mut self, shared: &SharedProcessData) -> Vec<AgentSession>;
 
     /// Return agent-specific rate limit info, if available from session data.
-    fn live_rate_limit(&self) -> Option<RateLimitInfo> {
-        None
+    fn live_rate_limits(&self) -> Vec<RateLimitInfo> {
+        Vec::new()
     }
 
     /// Return config directories discovered from running agent processes.
@@ -315,12 +315,20 @@ impl MultiCollector {
     /// `agent_cli` name (e.g. `"claude"`, `"codex"`).
     #[cfg(test)]
     pub fn with_hidden(hidden: &[String]) -> Self {
-        Self::with_hidden_and_claude_config_dirs(hidden, &[])
+        Self::with_hidden_and_config_dirs(hidden, &[], &[])
     }
 
     pub fn with_hidden_and_claude_config_dirs(
         hidden: &[String],
         claude_config_dirs: &[PathBuf],
+    ) -> Self {
+        Self::with_hidden_and_config_dirs(hidden, claude_config_dirs, &[])
+    }
+
+    pub fn with_hidden_and_config_dirs(
+        hidden: &[String],
+        claude_config_dirs: &[PathBuf],
+        codex_config_dirs: &[PathBuf],
     ) -> Self {
         let is_hidden = |name: &str| hidden.iter().any(|h| h.eq_ignore_ascii_case(name));
         let mut collectors: Vec<Box<dyn AgentCollector>> = Vec::new();
@@ -330,7 +338,9 @@ impl MultiCollector {
             )));
         }
         if !is_hidden("codex") {
-            collectors.push(Box::new(CodexCollector::new()));
+            collectors.push(Box::new(CodexCollector::with_configured_dirs(
+                codex_config_dirs.to_vec(),
+            )));
         }
         if !is_hidden("opencode") {
             collectors.push(Box::new(OpenCodeCollector::new()));
@@ -359,7 +369,7 @@ impl MultiCollector {
     pub fn agent_rate_limits(&self) -> Vec<RateLimitInfo> {
         self.collectors
             .iter()
-            .filter_map(|c| c.live_rate_limit())
+            .flat_map(|c| c.live_rate_limits())
             .collect()
     }
 

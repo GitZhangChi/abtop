@@ -537,6 +537,7 @@ pub fn populate_demo(app: &mut App) {
     app.rate_limits = vec![
         RateLimitInfo {
             source: "claude".into(),
+            config_root: "~/.claude".into(),
             five_hour_pct: Some(35.0),
             five_hour_resets_at: Some(now_secs() + 3 * 3600),
             five_hour_window_minutes: Some(300),
@@ -547,6 +548,7 @@ pub fn populate_demo(app: &mut App) {
         },
         RateLimitInfo {
             source: "codex".into(),
+            config_root: "~/.codex".into(),
             five_hour_pct: Some(9.0),
             five_hour_resets_at: Some(now_secs() + 4 * 3600),
             five_hour_window_minutes: Some(300),

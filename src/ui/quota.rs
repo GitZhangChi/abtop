@@ -66,11 +66,17 @@ pub(crate) fn draw_quota_panel_active(
             height: content_h,
         };
 
-        let rl = app
+        let mut limits: Vec<&RateLimitInfo> = app
             .rate_limits
             .iter()
-            .find(|r| r.source.eq_ignore_ascii_case(source));
-        draw_source_column(f, col_area, source, rl, &cpu_grad, theme);
+            .filter(|r| r.source.eq_ignore_ascii_case(source))
+            .collect();
+        limits.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.config_root.cmp(&b.config_root))
+        });
+        draw_source_column(f, col_area, source, &limits, &cpu_grad, theme);
     }
 
     // Total tokens summary on last row (full width)
@@ -100,14 +106,14 @@ fn draw_source_column(
     f: &mut Frame,
     area: Rect,
     source: &str,
-    rl: Option<&RateLimitInfo>,
+    limits: &[&RateLimitInfo],
     cpu_grad: &[ratatui::style::Color; 101],
     theme: &Theme,
 ) {
     let col_w_usize = area.width as usize;
     let bar_w = col_w_usize.saturating_sub(10).clamp(2, 8);
 
-    let Some(rl) = rl else {
+    let Some(rl) = limits.first().copied() else {
         let hint = if source.eq_ignore_ascii_case("claude") {
             t("quota.abtop_setup")
         } else {
@@ -134,6 +140,11 @@ fn draw_source_column(
         return;
     };
 
+    if limits.len() > 1 {
+        draw_multi_account_column(f, area, source, limits, cpu_grad, theme);
+        return;
+    }
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -154,7 +165,7 @@ fn draw_source_column(
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
-        format!(" {}", rl.source.to_uppercase()),
+        format!(" {}", rate_limit_title(source, rl)),
         Style::default()
             .fg(source_color)
             .add_modifier(Modifier::BOLD),
@@ -235,6 +246,105 @@ fn draw_source_column(
     f.render_widget(Paragraph::new(lines), area);
 }
 
+fn draw_multi_account_column(
+    f: &mut Frame,
+    area: Rect,
+    source: &str,
+    limits: &[&RateLimitInfo],
+    cpu_grad: &[ratatui::style::Color; 101],
+    theme: &Theme,
+) {
+    let max_accounts = area.height.saturating_sub(1) as usize;
+    let mut lines = vec![Line::from(Span::styled(
+        format!(" {}", source.to_uppercase()),
+        Style::default()
+            .fg(theme.title)
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    for rl in limits.iter().take(max_accounts) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let stale = rl
+            .updated_at
+            .is_some_and(|timestamp| now.saturating_sub(timestamp) > STALE_SECS);
+        let mut spans = vec![Span::styled(
+            format!(" {:<7}", account_profile_label(source, rl)),
+            Style::default()
+                .fg(if stale {
+                    theme.inactive_fg
+                } else {
+                    theme.main_fg
+                })
+                .add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(compact_window_spans(
+            rl.five_hour_pct,
+            rl.five_hour_window_minutes,
+            t("quota.5h"),
+            cpu_grad,
+            theme,
+        ));
+        spans.extend(compact_window_spans(
+            rl.seven_day_pct,
+            rl.seven_day_window_minutes,
+            t("quota.7d"),
+            cpu_grad,
+            theme,
+        ));
+        lines.push(Line::from(spans));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn compact_window_spans(
+    used_pct: Option<f64>,
+    window_minutes: Option<u64>,
+    fallback: String,
+    cpu_grad: &[ratatui::style::Color; 101],
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let label = format_window_label(window_minutes, fallback);
+    let Some(used_pct) = used_pct else {
+        return vec![Span::styled(
+            format!(" {label} —"),
+            Style::default().fg(theme.inactive_fg),
+        )];
+    };
+    let remaining = (100.0 - used_pct).clamp(0.0, 100.0);
+    vec![Span::styled(
+        format!(" {label} {:>3.0}%", remaining),
+        Style::default().fg(grad_at(cpu_grad, used_pct)),
+    )]
+}
+
+fn rate_limit_title(source: &str, info: &RateLimitInfo) -> String {
+    let source = source.to_uppercase();
+    format!("{source} · {}", account_profile_label(&source, info))
+}
+
+fn account_profile_label(source: &str, info: &RateLimitInfo) -> String {
+    let Some(name) = std::path::Path::new(&info.config_root)
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return "account".to_string();
+    };
+    let name = name.trim_start_matches('.');
+    let profile = name
+        .strip_prefix(&format!("{}-", source.to_ascii_lowercase()))
+        .unwrap_or(name);
+    let profile = if profile.eq_ignore_ascii_case(source) {
+        "default"
+    } else {
+        profile
+    };
+    profile.to_string()
+}
+
 fn format_window_label(window_minutes: Option<u64>, fallback: String) -> String {
     let Some(minutes) = window_minutes else {
         return fallback;
@@ -280,5 +390,76 @@ pub(crate) fn format_reset_time(reset_ts: u64) -> String {
         let d = diff / 86400;
         let h = (diff % 86400) / 3600;
         format!("{} {}{} {}{}", prefix, d, t("time.d"), h, t("time.h"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PanelVisibility;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn account_profile_labels_distinguish_auth_roots() {
+        let codex_2001 = RateLimitInfo {
+            source: "codex".to_string(),
+            config_root: "~/.codex-2001".to_string(),
+            ..Default::default()
+        };
+        let codex_default = RateLimitInfo {
+            source: "codex".to_string(),
+            config_root: "~/.codex".to_string(),
+            ..Default::default()
+        };
+        let claude_alex = RateLimitInfo {
+            source: "claude".to_string(),
+            config_root: "~/.claude-alex".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(account_profile_label("codex", &codex_2001), "2001");
+        assert_eq!(account_profile_label("codex", &codex_default), "default");
+        assert_eq!(account_profile_label("claude", &claude_alex), "alex");
+        assert_eq!(rate_limit_title("codex", &codex_2001), "CODEX · 2001");
+    }
+
+    #[test]
+    fn quota_panel_renders_each_auth_profile() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        app.rate_limits = [
+            ("claude", "~/.claude-alex", 55.0),
+            ("claude", "~/.claude-chi", 26.0),
+            ("codex", "~/.codex-2001", 38.0),
+            ("codex", "~/.codex-3001", 39.0),
+        ]
+        .into_iter()
+        .map(|(source, config_root, used)| RateLimitInfo {
+            source: source.to_string(),
+            config_root: config_root.to_string(),
+            five_hour_pct: Some(used),
+            five_hour_window_minutes: Some(300),
+            seven_day_pct: Some(used + 10.0),
+            seven_day_window_minutes: Some(10_080),
+            updated_at: Some(u64::MAX),
+            ..Default::default()
+        })
+        .collect();
+
+        let backend = TestBackend::new(64, 9);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_quota_panel(frame, &app, Rect::new(0, 0, 64, 9), &app.theme);
+            })
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+
+        for expected in ["CLAUDE", "alex", "chi", "CODEX", "2001", "3001"] {
+            assert!(
+                text.contains(expected),
+                "quota panel should show {expected}\n{text}"
+            );
+        }
     }
 }

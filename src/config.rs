@@ -33,6 +33,9 @@ pub struct AppConfig {
     /// Additional Claude config directories to scan for sessions.
     /// Useful for multi-profile setups that use separate CLAUDE_CONFIG_DIR roots.
     pub claude_config_dirs: Vec<PathBuf>,
+    /// Additional Codex config directories to scan for sessions.
+    /// Useful for multi-account setups that use separate CODEX_HOME roots.
+    pub codex_config_dirs: Vec<PathBuf>,
     pub panels: PanelVisibility,
     /// UI language override. Empty string means auto-detect from `LANG`.
     /// Recognized values: "en", "zh" (anything starting with "zh" maps to Simplified Chinese).
@@ -45,6 +48,7 @@ impl Default for AppConfig {
             theme: "btop".to_string(),
             hidden_agents: Vec::new(),
             claude_config_dirs: Vec::new(),
+            codex_config_dirs: Vec::new(),
             panels: PanelVisibility::default(),
             language: String::new(),
         }
@@ -91,6 +95,10 @@ fn parse_config_body(content: &str) -> AppConfig {
             }
             if key == "claude_config_dirs" {
                 config.claude_config_dirs = parse_path_array(val);
+                continue;
+            }
+            if key == "codex_config_dirs" {
+                config.codex_config_dirs = parse_path_array(val);
                 continue;
             }
             let val = val.trim_matches('"').trim_matches('\'');
@@ -260,6 +268,17 @@ mod tests {
         let cfg = parse_config_body(r#"claude_config_dirs = ["~/.claude-personal"]"#);
 
         assert_eq!(cfg.claude_config_dirs, vec![home.join(".claude-personal")]);
+    }
+
+    #[test]
+    fn parse_config_body_loads_codex_config_dirs() {
+        let home = dirs::home_dir().unwrap();
+        let cfg = parse_config_body(r#"codex_config_dirs = ["~/.codex-2001", "~/.codex-3001"]"#);
+
+        assert_eq!(
+            cfg.codex_config_dirs,
+            vec![home.join(".codex-2001"), home.join(".codex-3001")]
+        );
     }
 
     fn theme_update(name: &str) -> Vec<(&'static str, String)> {

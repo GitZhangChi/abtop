@@ -37,6 +37,9 @@ pub const MAX_FILE_ACCESSES: usize = 1000;
 pub struct RateLimitInfo {
     /// "claude" or "codex"
     pub source: String,
+    /// Home-abbreviated auth/config root (for example `~/.codex-2001`).
+    /// Empty only for legacy data that predates multi-account attribution.
+    pub config_root: String,
     /// 5-hour window usage percentage (0-100)
     pub five_hour_pct: Option<f64>,
     /// 5-hour window reset timestamp (epoch seconds)

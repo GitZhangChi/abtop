@@ -26,10 +26,23 @@ use std::time::{Duration, Instant};
 /// - `response_item`: assistant messages (commentary/final), function_call, function_call_output
 /// - `turn_context`: model, cwd, effort, context window size
 pub struct CodexCollector {
-    sessions_dir: PathBuf,
-    /// Latest rate limit info parsed from Codex JSONL token_count events.
-    pub last_rate_limit: Option<RateLimitInfo>,
+    /// All known Codex session roots (`<CODEX_HOME>/sessions`).
+    sessions_dirs: Vec<PathBuf>,
+    /// User-configured Codex homes from abtop config.
+    configured_config_dirs: Vec<PathBuf>,
+    /// Latest rate limit per Codex auth/config root.
+    pub last_rate_limits: HashMap<String, RateLimitInfo>,
     desktop_recent_scanner: DesktopRecentRolloutScanner,
+    /// First observation time for live processes that have not created a
+    /// rollout yet. Keeps placeholder session start times stable across ticks.
+    placeholder_started_at: HashMap<u32, u64>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct CodexProcessPaths {
+    cwd: Option<PathBuf>,
+    rollout: Option<PathBuf>,
+    config_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -46,6 +59,7 @@ struct DesktopRecentRolloutScanResult {
 
 struct DesktopRecentRolloutScanner {
     cached: Vec<PathBuf>,
+    cached_sessions_dirs: Vec<PathBuf>,
     in_flight: bool,
     last_started: Option<Instant>,
     tx: Sender<DesktopRecentRolloutScanResult>,
@@ -59,6 +73,7 @@ impl DesktopRecentRolloutScanner {
         let (tx, rx) = mpsc::channel();
         Self {
             cached: Vec::new(),
+            cached_sessions_dirs: Vec::new(),
             in_flight: false,
             last_started: None,
             tx,
@@ -66,10 +81,10 @@ impl DesktopRecentRolloutScanner {
         }
     }
 
-    fn update(&mut self, sessions_dir: &Path, active_mtime_secs: u64) -> Vec<PathBuf> {
+    fn update(&mut self, sessions_dirs: &[PathBuf], active_mtime_secs: u64) -> Vec<PathBuf> {
         self.poll_completed();
-        if self.should_start(sessions_dir) {
-            self.start(sessions_dir.to_path_buf(), active_mtime_secs);
+        if self.should_start(sessions_dirs) {
+            self.start(sessions_dirs.to_vec(), active_mtime_secs);
         }
         self.cached.clone()
     }
@@ -81,21 +96,25 @@ impl DesktopRecentRolloutScanner {
         }
     }
 
-    fn should_start(&self, sessions_dir: &Path) -> bool {
-        if self.in_flight || !sessions_dir.exists() {
+    fn should_start(&self, sessions_dirs: &[PathBuf]) -> bool {
+        if self.in_flight || !sessions_dirs.iter().any(|dir| dir.exists()) {
             return false;
+        }
+        if self.cached_sessions_dirs != sessions_dirs {
+            return true;
         }
         self.last_started
             .is_none_or(|started| started.elapsed() >= DESKTOP_RECENT_ROLLOUT_RESCAN_INTERVAL)
     }
 
-    fn start(&mut self, sessions_dir: PathBuf, active_mtime_secs: u64) {
+    fn start(&mut self, sessions_dirs: Vec<PathBuf>, active_mtime_secs: u64) {
         self.in_flight = true;
         self.last_started = Some(Instant::now());
+        self.cached_sessions_dirs = sessions_dirs.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let rollouts = CodexCollector::recent_desktop_rollouts(
-                &sessions_dir,
+            let rollouts = CodexCollector::recent_desktop_rollouts_from_roots(
+                &sessions_dirs,
                 &HashSet::new(),
                 &HashSet::new(),
                 active_mtime_secs,
@@ -107,22 +126,121 @@ impl DesktopRecentRolloutScanner {
 
 impl CodexCollector {
     pub fn new() -> Self {
-        let home = dirs::home_dir().unwrap_or_default();
+        Self::with_configured_dirs(Vec::new())
+    }
+
+    pub fn with_configured_dirs(configured_config_dirs: Vec<PathBuf>) -> Self {
         Self {
-            sessions_dir: home.join(".codex").join("sessions"),
-            last_rate_limit: None,
+            sessions_dirs: Vec::new(),
+            configured_config_dirs,
+            last_rate_limits: HashMap::new(),
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+            placeholder_started_at: HashMap::new(),
+        }
+    }
+
+    /// Refresh Codex homes from the default, sibling profiles, explicit
+    /// configuration, and process environments on platforms that expose them.
+    fn refresh_sessions_dirs(&mut self, process_info: &HashMap<u32, ProcInfo>) {
+        let mut roots = std::collections::BTreeSet::new();
+
+        if let Some(home) = dirs::home_dir() {
+            let default = home.join(".codex");
+            if is_codex_config_root(&default) {
+                roots.insert(default);
+            }
+            roots.extend(discover_home_codex_config_dirs(&home));
+        }
+
+        for root in &self.configured_config_dirs {
+            if is_codex_config_root(root) {
+                roots.insert(root.clone());
+            }
+        }
+
+        if let Ok(root) = std::env::var("CODEX_HOME") {
+            let root = PathBuf::from(root);
+            if is_codex_config_root(&root) {
+                roots.insert(root);
+            }
+        }
+
+        for (pid, info) in process_info {
+            if !process::cmd_has_binary(&info.command, "codex") {
+                continue;
+            }
+            if let Some(root) = read_codex_home_from_proc(*pid) {
+                let root = PathBuf::from(root);
+                if is_codex_config_root(&root) {
+                    roots.insert(root);
+                }
+            }
+        }
+
+        self.sessions_dirs = roots
+            .into_iter()
+            .map(|root| root.join("sessions"))
+            .collect();
+    }
+
+    fn merge_sessions_dirs<I>(&mut self, sessions_dirs: I)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let mut dirs: std::collections::BTreeSet<PathBuf> =
+            self.sessions_dirs.iter().cloned().collect();
+        dirs.extend(sessions_dirs);
+        self.sessions_dirs = dirs.into_iter().collect();
+    }
+
+    fn record_rate_limit(&mut self, info: RateLimitInfo) {
+        let key = info.config_root.clone();
+        let newer = self
+            .last_rate_limits
+            .get(&key)
+            .is_none_or(|old| info.updated_at > old.updated_at);
+        if newer {
+            super::rate_limit::write_codex_cache(&info);
+            self.last_rate_limits.insert(key, info);
+        }
+    }
+
+    fn hydrate_profile_rate_limits(&mut self, bootstrap_from_rollouts: bool) {
+        let profiles: Vec<(PathBuf, PathBuf)> = self
+            .sessions_dirs
+            .iter()
+            .filter_map(|sessions| {
+                sessions
+                    .parent()
+                    .map(|root| (root.to_path_buf(), sessions.clone()))
+            })
+            .collect();
+
+        for (config_root, sessions_dir) in profiles {
+            let key = super::abbrev_path(&config_root);
+            if self.last_rate_limits.contains_key(&key) {
+                continue;
+            }
+            if let Some(info) = super::rate_limit::read_codex_cache(&config_root) {
+                self.last_rate_limits.insert(key, info);
+                continue;
+            }
+            if !bootstrap_from_rollouts {
+                continue;
+            }
+            if let Some(mut info) = latest_rate_limit_from_rollouts(&sessions_dir) {
+                info.config_root = key;
+                self.record_rate_limit(info);
+            }
         }
     }
 
     fn collect_sessions(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
-        if !self.sessions_dir.exists() {
-            self.last_rate_limit = None;
-            return vec![];
+        if shared.slow_tick || self.sessions_dirs.is_empty() {
+            self.refresh_sessions_dirs(&shared.process_info);
         }
 
-        // Reset live rate limit each pass — only keep it if a current session provides one
-        self.last_rate_limit = None;
+        self.last_rate_limits.clear();
 
         // Step 1: Find running codex processes from shared ps data (no extra ps call).
         // When MCP suppression is on, exclude `codex mcp-server` PIDs — those
@@ -130,7 +248,16 @@ impl CodexCollector {
         let codex_pids =
             Self::find_codex_pids_from_shared(&shared.process_info, &shared.mcp_server_pids);
         let just_pids: Vec<u32> = codex_pids.iter().map(|(p, _)| *p).collect();
-        let pid_to_jsonl = Self::map_pid_to_jsonl(&just_pids, &self.sessions_dir);
+        let pid_to_paths = Self::map_pid_to_open_paths(&just_pids, &self.sessions_dirs);
+        let pid_to_jsonl: HashMap<u32, PathBuf> = pid_to_paths
+            .iter()
+            .filter_map(|(pid, paths)| paths.rollout.clone().map(|path| (*pid, path)))
+            .collect();
+        self.merge_sessions_dirs(
+            pid_to_jsonl
+                .values()
+                .filter_map(|path| codex_sessions_dir_from_rollout(path)),
+        );
         let pid_is_exec: HashMap<u32, bool> = codex_pids.into_iter().collect();
 
         let mut sessions = Vec::new();
@@ -153,18 +280,35 @@ impl CodexCollector {
             ) {
                 seen_jsonl.insert(jsonl_path.clone());
                 if let Some(new_rl) = rl {
-                    let newer = self
-                        .last_rate_limit
-                        .as_ref()
-                        .is_none_or(|old| new_rl.updated_at > old.updated_at);
-                    if newer {
-                        super::rate_limit::write_codex_cache(&new_rl);
-                        self.last_rate_limit = Some(new_rl);
-                    }
+                    self.record_rate_limit(new_rl);
                 }
                 sessions.push(session);
             }
         }
+
+        // A freshly-started Codex TUI does not create/open a rollout until its
+        // first prompt. Surface it immediately using cwd + CODEX_HOME inferred
+        // from process metadata, then replace this placeholder once a rollout
+        // appears on a later tick.
+        for (pid, is_exec) in &pid_is_exec {
+            if pid_to_jsonl.contains_key(pid) {
+                self.placeholder_started_at.remove(pid);
+                continue;
+            }
+            let paths = pid_to_paths.get(pid).cloned().unwrap_or_default();
+            if let Some(session) = self.load_placeholder_session(
+                *pid,
+                *is_exec,
+                &paths,
+                &shared.process_info,
+                &shared.children_map,
+                &shared.ports,
+            ) {
+                sessions.push(session);
+            }
+        }
+        self.placeholder_started_at
+            .retain(|pid, _| pid_is_exec.contains_key(pid) && !pid_to_jsonl.contains_key(pid));
 
         let desktop_pids = Self::find_codex_desktop_pids_from_shared(
             &shared.process_info,
@@ -188,14 +332,14 @@ impl CodexCollector {
                 super::mcp::ACTIVE_MTIME_SECS,
             );
             let mut desktop_rollout_paths = Self::foreground_desktop_rollouts(
-                &self.sessions_dir,
+                &self.sessions_dirs,
                 &seen_jsonl,
                 &shared.mcp_owned_rollouts,
                 super::mcp::ACTIVE_MTIME_SECS,
             );
             for path in self
                 .desktop_recent_scanner
-                .update(&self.sessions_dir, super::mcp::ACTIVE_MTIME_SECS)
+                .update(&self.sessions_dirs, super::mcp::ACTIVE_MTIME_SECS)
             {
                 if seen_jsonl.contains(&path) || shared.mcp_owned_rollouts.contains(&path) {
                     continue;
@@ -207,9 +351,7 @@ impl CodexCollector {
             Self::sort_rollouts_by_mtime_desc(&mut desktop_rollout_paths);
 
             for path in desktop_rollout_paths {
-                let pid = desktop_pid_for_path
-                    .get(&path)
-                    .copied();
+                let pid = desktop_pid_for_path.get(&path).copied();
                 let process_ctx = CodexProcessContext {
                     pid,
                     is_exec: false,
@@ -225,14 +367,7 @@ impl CodexCollector {
                 ) {
                     seen_jsonl.insert(path);
                     if let Some(new_rl) = rl {
-                        let newer = self
-                            .last_rate_limit
-                            .as_ref()
-                            .is_none_or(|old| new_rl.updated_at > old.updated_at);
-                        if newer {
-                            super::rate_limit::write_codex_cache(&new_rl);
-                            self.last_rate_limit = Some(new_rl);
-                        }
+                        self.record_rate_limit(new_rl);
                     }
                     sessions.push(session);
                 }
@@ -260,14 +395,7 @@ impl CodexCollector {
                 ) {
                     seen_jsonl.insert(path);
                     if let Some(new_rl) = rl {
-                        let newer = self
-                            .last_rate_limit
-                            .as_ref()
-                            .is_none_or(|old| new_rl.updated_at > old.updated_at);
-                        if newer {
-                            super::rate_limit::write_codex_cache(&new_rl);
-                            self.last_rate_limit = Some(new_rl);
-                        }
+                        self.record_rate_limit(new_rl);
                     }
                     sessions.push(session);
                 }
@@ -276,7 +404,11 @@ impl CodexCollector {
 
         // Recently finished sessions: scan today's JSONL files not owned by any running process.
         // This ensures Codex sessions transition to Done instead of vanishing.
-        if let Some(recent_dir) = Self::today_session_dir(&self.sessions_dir) {
+        let recent_sessions_dirs = self.sessions_dirs.clone();
+        for sessions_dir in &recent_sessions_dirs {
+            let Some(recent_dir) = Self::today_session_dir(sessions_dir) else {
+                continue;
+            };
             if let Ok(entries) = fs::read_dir(&recent_dir) {
                 for entry in entries.flatten() {
                     // Skip symlinks to avoid reading unintended files
@@ -322,20 +454,15 @@ impl CodexCollector {
                         &shared.ports,
                     ) {
                         if let Some(new_rl) = rl {
-                            let newer = self
-                                .last_rate_limit
-                                .as_ref()
-                                .is_none_or(|old| new_rl.updated_at > old.updated_at);
-                            if newer {
-                                super::rate_limit::write_codex_cache(&new_rl);
-                                self.last_rate_limit = Some(new_rl);
-                            }
+                            self.record_rate_limit(new_rl);
                         }
                         sessions.push(session);
                     }
                 }
             }
         }
+
+        self.hydrate_profile_rate_limits(shared.slow_tick);
 
         sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
         sessions
@@ -418,15 +545,15 @@ impl CodexCollector {
     }
 
     fn foreground_desktop_rollouts(
-        sessions_dir: &Path,
+        sessions_dirs: &[PathBuf],
         seen_jsonl: &HashSet<PathBuf>,
         mcp_owned_rollouts: &HashSet<PathBuf>,
         active_mtime_secs: u64,
     ) -> Vec<PathBuf> {
-        let Some(today_dir) = Self::today_session_dir(sessions_dir) else {
-            return Vec::new();
-        };
-        let roots = [today_dir];
+        let roots: Vec<PathBuf> = sessions_dirs
+            .iter()
+            .filter_map(|dir| Self::today_session_dir(dir))
+            .collect();
         Self::recent_desktop_rollouts_from_roots(
             &roots,
             seen_jsonl,
@@ -455,6 +582,7 @@ impl CodexCollector {
         candidates
     }
 
+    #[cfg(test)]
     fn recent_desktop_rollouts(
         sessions_dir: &Path,
         seen_jsonl: &HashSet<PathBuf>,
@@ -625,7 +753,13 @@ impl CodexCollector {
 
         // Git stats: populated by MultiCollector on slow ticks
         let (git_added, git_modified) = (0, 0);
-        let rate_limit = result.rate_limit.clone();
+        let config_root = super::abbrev_path(
+            &codex_config_root_from_rollout(jsonl_path).unwrap_or_else(|| PathBuf::from(".")),
+        );
+        let mut rate_limit = result.rate_limit.clone();
+        if let Some(info) = &mut rate_limit {
+            info.config_root = config_root.clone();
+        }
 
         Some((
             AgentSession {
@@ -665,14 +799,113 @@ impl CodexCollector {
                 pending_since_ms: result.pending_since_ms,
                 thinking_since_ms: result.thinking_since_ms,
                 file_accesses: vec![],
-                config_root: super::abbrev_path(
-                    self.sessions_dir
-                        .parent()
-                        .unwrap_or(std::path::Path::new(".")),
-                ),
+                config_root,
             },
             rate_limit,
         ))
+    }
+
+    fn load_placeholder_session(
+        &mut self,
+        pid: u32,
+        is_exec: bool,
+        paths: &CodexProcessPaths,
+        process_info: &HashMap<u32, ProcInfo>,
+        children_map: &HashMap<u32, Vec<u32>>,
+        ports: &HashMap<u32, Vec<u16>>,
+    ) -> Option<AgentSession> {
+        let proc = process_info.get(&pid)?;
+        let cwd = paths
+            .cwd
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "?".to_string());
+        let project_name = process::last_path_segment(&cwd).unwrap_or("?").to_string();
+        let has_active_child = process::has_active_descendant(pid, children_map, process_info, 5.0);
+        let status = if is_exec || has_active_child {
+            SessionStatus::Executing
+        } else {
+            SessionStatus::Waiting
+        };
+        let started_at = *self
+            .placeholder_started_at
+            .entry(pid)
+            .or_insert_with(current_epoch_ms);
+
+        let mut children = Vec::new();
+        let mut stack: Vec<u32> = children_map.get(&pid).cloned().unwrap_or_default();
+        let mut visited = HashSet::new();
+        while let Some(cpid) = stack.pop() {
+            if !visited.insert(cpid) {
+                continue;
+            }
+            if let Some(cproc) = process_info.get(&cpid) {
+                children.push(ChildProcess {
+                    pid: cpid,
+                    command: cproc.command.clone(),
+                    mem_kb: cproc.rss_kb,
+                    port: ports.get(&cpid).and_then(|values| values.first().copied()),
+                });
+            }
+            if let Some(grandchildren) = children_map.get(&cpid) {
+                stack.extend(grandchildren);
+            }
+        }
+
+        let config_root = paths
+            .config_root
+            .clone()
+            .or_else(|| {
+                (self.sessions_dirs.len() == 1)
+                    .then(|| self.sessions_dirs[0].parent().map(Path::to_path_buf))
+                    .flatten()
+            })
+            .map(|path| super::abbrev_path(&path))
+            .unwrap_or_else(|| "?".to_string());
+
+        Some(AgentSession {
+            agent_cli: "codex",
+            pid,
+            session_id: format!("codex-pid-{pid}"),
+            cwd,
+            project_name,
+            started_at,
+            status,
+            model: String::new(),
+            effort: String::new(),
+            context_percent: 0.0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read: 0,
+            total_cache_create: 0,
+            turn_count: 0,
+            current_tasks: vec![if is_exec {
+                "starting...".to_string()
+            } else {
+                "waiting for first prompt".to_string()
+            }],
+            mem_mb: proc.rss_kb / 1024,
+            version: String::new(),
+            git_branch: String::new(),
+            git_added: 0,
+            git_modified: 0,
+            token_history: vec![],
+            context_history: vec![],
+            compaction_count: 0,
+            context_window: 0,
+            subagents: vec![],
+            mem_file_count: 0,
+            mem_line_count: 0,
+            children,
+            initial_prompt: String::new(),
+            first_assistant_text: String::new(),
+            chat_messages: vec![],
+            tool_calls: vec![],
+            pending_since_ms: 0,
+            thinking_since_ms: 0,
+            file_accesses: vec![],
+            config_root,
+        })
     }
 
     /// Find PIDs of running codex processes from shared process data (no extra ps call).
@@ -740,18 +973,17 @@ impl CodexCollector {
         pids
     }
 
-    /// Map codex PIDs to their open rollout-*.jsonl files.
+    /// Map Codex PIDs to cwd, CODEX_HOME, and an open rollout when present.
     ///
     /// On Linux, scans /proc/{pid}/fd symlinks directly (no process spawn).
     /// On Windows, scans ~/.codex/sessions/YYYY/MM/DD/ for recently modified
     /// JSONL files and assigns them to discovered PIDs, since Windows has no
     /// equivalent of lsof for enumerating open file descriptors.
     /// Falls back to lsof on macOS/other platforms.
-    fn map_pid_to_jsonl(pids: &[u32], sessions_dir: &Path) -> HashMap<u32, PathBuf> {
-        // sessions_dir is consumed only by the windows arm below.
-        #[cfg(not(target_os = "windows"))]
-        let _ = sessions_dir;
-
+    fn map_pid_to_open_paths(
+        pids: &[u32],
+        sessions_dirs: &[PathBuf],
+    ) -> HashMap<u32, CodexProcessPaths> {
         let mut map = HashMap::new();
         if pids.is_empty() {
             return map;
@@ -760,16 +992,15 @@ impl CodexCollector {
         #[cfg(target_os = "linux")]
         {
             for &pid in pids {
+                let mut paths = CodexProcessPaths {
+                    cwd: fs::read_link(format!("/proc/{pid}/cwd")).ok(),
+                    config_root: read_codex_home_from_proc(pid).map(PathBuf::from),
+                    ..CodexProcessPaths::default()
+                };
                 for target in process::scan_proc_fds(pid) {
-                    let is_rollout = target
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"));
-                    if is_rollout {
-                        map.insert(pid, target);
-                        break;
-                    }
+                    update_codex_process_path(&mut paths, &target, sessions_dirs);
                 }
+                map.insert(pid, paths);
             }
             map
         }
@@ -777,13 +1008,16 @@ impl CodexCollector {
         #[cfg(target_os = "windows")]
         {
             // Windows has no lsof or /proc/{pid}/fd to map PIDs to open files.
-            // Instead, scan today's ~/.codex/sessions/YYYY/MM/DD/ directory for
-            // rollout-*.jsonl files, then assign them to discovered codex PIDs.
+            // Instead, scan today's session directory under every known Codex
+            // home, then assign rollout files to discovered Codex PIDs.
             // Prefer recently modified files, but fall back to any today's file
             // since Codex may be idle (waiting for input) and not actively writing.
             let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
 
-            if let Some(today_dir) = Self::today_session_dir(sessions_dir) {
+            for sessions_dir in sessions_dirs {
+                let Some(today_dir) = Self::today_session_dir(sessions_dir) else {
+                    continue;
+                };
                 if let Ok(entries) = fs::read_dir(&today_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
@@ -806,7 +1040,15 @@ impl CodexCollector {
             // Assign candidates to PIDs (most recent file → first PID)
             for (i, &pid_u32) in pids.iter().enumerate() {
                 if i < candidates.len() {
-                    map.insert(pid_u32, candidates[i].0.clone());
+                    let rollout = candidates[i].0.clone();
+                    let mut paths = CodexProcessPaths {
+                        rollout: Some(rollout.clone()),
+                        ..CodexProcessPaths::default()
+                    };
+                    update_codex_process_path(&mut paths, &rollout, sessions_dirs);
+                    map.insert(pid_u32, paths);
+                } else {
+                    map.insert(pid_u32, CodexProcessPaths::default());
                 }
             }
 
@@ -816,7 +1058,7 @@ impl CodexCollector {
         #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
         {
             let pid_args: Vec<String> = pids.iter().map(|p| format!("-p{}", p)).collect();
-            let mut args = vec!["-F", "pn"];
+            let mut args = vec!["-F", "pfn"];
             for pa in &pid_args {
                 args.push(pa);
             }
@@ -824,23 +1066,185 @@ impl CodexCollector {
             let output = Command::new("lsof").args(&args).output().ok();
 
             if let Some(output) = output {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut current_pid: Option<u32> = None;
-                for line in stdout.lines() {
-                    if let Some(pid_str) = line.strip_prefix('p') {
-                        current_pid = pid_str.parse::<u32>().ok();
-                    } else if let Some(name) = line.strip_prefix('n') {
-                        if let Some(pid) = current_pid {
-                            if name.contains("rollout-") && name.ends_with(".jsonl") {
-                                map.insert(pid, PathBuf::from(name));
-                            }
-                        }
-                    }
-                }
+                map = parse_codex_lsof_output(
+                    &String::from_utf8_lossy(&output.stdout),
+                    sessions_dirs,
+                );
+            }
+            for pid in pids {
+                map.entry(*pid).or_default();
             }
             map
         }
     }
+}
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn known_codex_config_root(path: &Path, sessions_dirs: &[PathBuf]) -> Option<PathBuf> {
+    sessions_dirs
+        .iter()
+        .filter_map(|sessions| sessions.parent())
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.as_os_str().len())
+        .map(Path::to_path_buf)
+}
+
+fn update_codex_process_path(
+    paths: &mut CodexProcessPaths,
+    path: &Path,
+    sessions_dirs: &[PathBuf],
+) {
+    let is_rollout = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
+    if is_rollout {
+        paths.rollout = Some(path.to_path_buf());
+    }
+
+    let Some(candidate) = known_codex_config_root(path, sessions_dirs) else {
+        return;
+    };
+    let should_replace = paths
+        .config_root
+        .as_ref()
+        .is_none_or(|current| candidate.as_os_str().len() > current.as_os_str().len());
+    if should_replace {
+        paths.config_root = Some(candidate);
+    }
+}
+
+fn parse_codex_lsof_output(
+    stdout: &str,
+    sessions_dirs: &[PathBuf],
+) -> HashMap<u32, CodexProcessPaths> {
+    let mut map = HashMap::new();
+    let mut current_pid = None;
+    let mut current_fd = "";
+
+    for line in stdout.lines() {
+        if let Some(pid) = line.strip_prefix('p').and_then(|value| value.parse().ok()) {
+            current_pid = Some(pid);
+            current_fd = "";
+            map.entry(pid).or_insert_with(CodexProcessPaths::default);
+        } else if let Some(fd) = line.strip_prefix('f') {
+            current_fd = fd;
+        } else if let (Some(pid), Some(name)) = (current_pid, line.strip_prefix('n')) {
+            let path = PathBuf::from(name);
+            let paths = map.entry(pid).or_insert_with(CodexProcessPaths::default);
+            if current_fd == "cwd" {
+                paths.cwd = Some(path.clone());
+            }
+            update_codex_process_path(paths, &path, sessions_dirs);
+        }
+    }
+
+    map
+}
+
+fn latest_rate_limit_from_rollouts(sessions_dir: &Path) -> Option<RateLimitInfo> {
+    let mut candidates = Vec::new();
+    collect_rollout_candidates(sessions_dir, &mut candidates);
+    candidates.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
+
+    candidates
+        .into_iter()
+        .find_map(|(path, _)| parse_codex_jsonl(&path).and_then(|result| result.rate_limit))
+}
+
+fn collect_rollout_candidates(dir: &Path, candidates: &mut Vec<(PathBuf, std::time::SystemTime)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_rollout_candidates(&path, candidates);
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if !file_type.is_file() || !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        candidates.push((path, modified));
+    }
+}
+
+fn is_codex_config_root(path: &Path) -> bool {
+    path.join("sessions").is_dir()
+}
+
+fn discover_home_codex_config_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut roots = std::collections::BTreeSet::new();
+    let Ok(entries) = fs::read_dir(home) else {
+        return Vec::new();
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name != ".codex" && !name.starts_with(".codex-") {
+            continue;
+        }
+        let path = entry.path();
+        if is_codex_config_root(&path) {
+            roots.insert(path);
+        }
+    }
+
+    roots.into_iter().collect()
+}
+
+fn codex_sessions_dir_from_rollout(path: &Path) -> Option<PathBuf> {
+    let mut cursor = path.parent();
+    while let Some(dir) = cursor {
+        if dir.file_name().and_then(|name| name.to_str()) == Some("sessions") {
+            return Some(dir.to_path_buf());
+        }
+        cursor = dir.parent();
+    }
+    None
+}
+
+fn codex_config_root_from_rollout(path: &Path) -> Option<PathBuf> {
+    codex_sessions_dir_from_rollout(path)
+        .and_then(|sessions| sessions.parent().map(Path::to_path_buf))
+}
+
+#[cfg(target_os = "linux")]
+fn read_codex_home_from_proc(pid: u32) -> Option<String> {
+    let data = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = b"CODEX_HOME=";
+    data.split(|byte| *byte == 0).find_map(|entry| {
+        entry
+            .strip_prefix(prefix)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_codex_home_from_proc(_pid: u32) -> Option<String> {
+    None
 }
 
 impl Default for CodexCollector {
@@ -854,10 +1258,10 @@ impl super::AgentCollector for CodexCollector {
         self.collect_sessions(shared)
     }
 
-    fn live_rate_limit(&self) -> Option<RateLimitInfo> {
-        self.last_rate_limit
-            .clone()
-            .or_else(super::rate_limit::read_codex_cache)
+    fn live_rate_limits(&self) -> Vec<RateLimitInfo> {
+        let mut limits: Vec<RateLimitInfo> = self.last_rate_limits.values().cloned().collect();
+        limits.sort_by(|a, b| a.config_root.cmp(&b.config_root));
+        limits
     }
 }
 
@@ -1485,6 +1889,163 @@ mod tests {
         file.set_modified(when).unwrap();
     }
 
+    #[test]
+    fn discover_home_codex_config_dirs_finds_account_profiles() {
+        let home = tempfile::tempdir().unwrap();
+        for name in [".codex", ".codex-2001", ".codex-3001"] {
+            fs::create_dir_all(home.path().join(name).join("sessions")).unwrap();
+        }
+        fs::create_dir_all(home.path().join(".codex-no-sessions")).unwrap();
+        fs::create_dir_all(home.path().join("codex-visible").join("sessions")).unwrap();
+
+        let roots = discover_home_codex_config_dirs(home.path());
+
+        assert_eq!(roots.len(), 3);
+        assert!(roots.contains(&home.path().join(".codex")));
+        assert!(roots.contains(&home.path().join(".codex-2001")));
+        assert!(roots.contains(&home.path().join(".codex-3001")));
+    }
+
+    #[test]
+    fn codex_config_root_is_derived_from_rollout_path() {
+        let path = PathBuf::from("/Users/me/.codex-2001/sessions/2026/08/04/rollout-session.jsonl");
+
+        assert_eq!(
+            codex_sessions_dir_from_rollout(&path),
+            Some(PathBuf::from("/Users/me/.codex-2001/sessions"))
+        );
+        assert_eq!(
+            codex_config_root_from_rollout(&path),
+            Some(PathBuf::from("/Users/me/.codex-2001"))
+        );
+    }
+
+    #[test]
+    fn parse_lsof_paths_identifies_profile_before_first_rollout() {
+        let sessions_dirs = vec![
+            PathBuf::from("/Users/me/.codex/sessions"),
+            PathBuf::from("/Users/me/.codex-2001/sessions"),
+            PathBuf::from("/Users/me/.codex-3001/sessions"),
+        ];
+        let stdout = r#"p42
+fcwd
+n/opt/github/abtop
+ftxt
+n/Users/me/.codex/packages/standalone/bin/codex
+f15
+n/Users/me/.codex-3001/logs_2.sqlite
+f16
+n/Users/me/.codex-3001/logs_2.sqlite-wal
+"#;
+
+        let paths = parse_codex_lsof_output(stdout, &sessions_dirs);
+        let process = paths.get(&42).unwrap();
+
+        assert_eq!(process.cwd, Some(PathBuf::from("/opt/github/abtop")));
+        assert_eq!(
+            process.config_root,
+            Some(PathBuf::from("/Users/me/.codex-3001"))
+        );
+        assert!(process.rollout.is_none());
+    }
+
+    #[test]
+    fn placeholder_session_is_profile_aware_and_stable() {
+        let profile = PathBuf::from("/Users/me/.codex-3001");
+        let mut collector = CodexCollector {
+            sessions_dirs: vec![profile.join("sessions")],
+            configured_config_dirs: Vec::new(),
+            last_rate_limits: HashMap::new(),
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+            placeholder_started_at: HashMap::new(),
+        };
+        let process_info = HashMap::from([(42, proc_info(42, 1, "codex --yolo"))]);
+        let paths = CodexProcessPaths {
+            cwd: Some(PathBuf::from("/opt/github/abtop")),
+            rollout: None,
+            config_root: Some(profile),
+        };
+
+        let first = collector
+            .load_placeholder_session(
+                42,
+                false,
+                &paths,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+        let second = collector
+            .load_placeholder_session(
+                42,
+                false,
+                &paths,
+                &process_info,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+            .unwrap();
+
+        assert_eq!(first.session_id, "codex-pid-42");
+        assert_eq!(first.config_root, "/Users/me/.codex-3001");
+        assert_eq!(first.cwd, "/opt/github/abtop");
+        assert_eq!(first.project_name, "abtop");
+        assert_eq!(first.status, SessionStatus::Waiting);
+        assert_eq!(first.current_tasks, vec!["waiting for first prompt"]);
+        assert_eq!(first.started_at, second.started_at);
+    }
+
+    #[test]
+    fn recently_finished_sessions_are_scanned_across_codex_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = chrono::Local::now().format("%Y/%m/%d").to_string();
+        let sessions_dirs: Vec<PathBuf> = [".codex-2001", ".codex-3001"]
+            .into_iter()
+            .map(|profile| temp.path().join(profile).join("sessions"))
+            .collect();
+
+        for (index, sessions_dir) in sessions_dirs.iter().enumerate() {
+            let today = sessions_dir.join(&now);
+            fs::create_dir_all(&today).unwrap();
+            let meta = format!(
+                r#"{{"type":"session_meta","timestamp":"2026-08-04T01:00:00Z","payload":{{"id":"account-{index}","cwd":"/tmp/project-{index}","cli_version":"0.1.0","timestamp":"2026-08-04T01:00:00Z"}}}}"#
+            );
+            write_jsonl(
+                &today.join(format!("rollout-account-{index}.jsonl")),
+                &[&meta],
+            );
+        }
+
+        let mut collector = CodexCollector {
+            sessions_dirs,
+            configured_config_dirs: Vec::new(),
+            last_rate_limits: HashMap::new(),
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+            placeholder_started_at: HashMap::new(),
+        };
+        let shared = super::super::SharedProcessData {
+            process_info: HashMap::new(),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        };
+
+        let sessions = collector.collect_sessions(&shared);
+
+        assert_eq!(sessions.len(), 2);
+        let roots: HashSet<&str> = sessions
+            .iter()
+            .map(|session| session.config_root.as_str())
+            .collect();
+        assert!(roots.iter().any(|root| root.ends_with(".codex-2001")));
+        assert!(roots.iter().any(|root| root.ends_with(".codex-3001")));
+    }
+
     #[cfg(windows)]
     #[test]
     fn find_codex_pids_windows_keeps_real_child_over_wrappers() {
@@ -1746,19 +2307,19 @@ mod tests {
     #[test]
     fn desktop_filesystem_only_rollout_is_unknown_without_fd_owner() {
         let sessions = tempfile::tempdir().unwrap();
-        let today = sessions.path().join(
-            chrono::Local::now()
-                .format("%Y/%m/%d")
-                .to_string(),
-        );
+        let today = sessions
+            .path()
+            .join(chrono::Local::now().format("%Y/%m/%d").to_string());
         fs::create_dir_all(&today).unwrap();
         let active = today.join("rollout-active.jsonl");
         write_jsonl(&active, &[DESKTOP_SESSION_META]);
 
         let mut collector = CodexCollector {
-            sessions_dir: sessions.path().to_path_buf(),
-            last_rate_limit: None,
+            sessions_dirs: vec![sessions.path().to_path_buf()],
+            configured_config_dirs: Vec::new(),
+            last_rate_limits: HashMap::new(),
             desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+            placeholder_started_at: HashMap::new(),
         };
         let mut shared = super::super::SharedProcessData {
             process_info: HashMap::new(),

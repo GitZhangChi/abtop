@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 /// File written by the StatusLine hook: ~/.claude/abtop-rate-limits.json
 const CLAUDE_RATE_FILE: &str = "abtop-rate-limits.json";
 
-/// Cached Codex rate limit: ~/.cache/abtop/codex-rate-limits.json
-const CODEX_CACHE_FILE: &str = "codex-rate-limits.json";
-
 #[derive(Debug, Deserialize)]
 struct RateLimitFile {
     #[serde(default)]
     source: String,
+    #[serde(default)]
+    config_root: String,
     #[serde(default)]
     five_hour: Option<WindowInfo>,
     #[serde(default)]
@@ -52,7 +51,8 @@ pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
             continue;
         }
         let path = dir.join(CLAUDE_RATE_FILE);
-        if let Some(info) = read_rate_file(&path, "claude") {
+        if let Some(mut info) = read_rate_file(&path, "claude") {
+            info.config_root = super::abbrev_path(&dir);
             results.push(info);
         }
     }
@@ -64,14 +64,17 @@ pub fn read_rate_limits(extra_dirs: &[PathBuf]) -> Vec<RateLimitInfo> {
 /// Rate limits have their own `resets_at` expiry and the cache is refreshed
 /// whenever the next Codex session runs, so the reader keeps serving the last
 /// known value regardless of file age — the UI shows "N m ago" for staleness.
-pub fn read_codex_cache() -> Option<RateLimitInfo> {
-    let path = codex_cache_path()?;
-    read_rate_file(&path, "codex")
+pub fn read_codex_cache(config_root: &Path) -> Option<RateLimitInfo> {
+    let path = codex_cache_path(config_root)?;
+    let mut info = read_rate_file(&path, "codex")?;
+    info.config_root = super::abbrev_path(config_root);
+    Some(info)
 }
 
 /// Write Codex rate limit to cache file (atomic: write temp + rename).
 pub fn write_codex_cache(info: &RateLimitInfo) {
-    let Some(path) = codex_cache_path() else {
+    let config_root = expand_abbreviated_home(&info.config_root);
+    let Some(path) = codex_cache_path(&config_root) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -79,7 +82,8 @@ pub fn write_codex_cache(info: &RateLimitInfo) {
     }
 
     let json = format!(
-        r#"{{"source":"codex","five_hour":{},"seven_day":{},"updated_at":{}}}"#,
+        r#"{{"source":"codex","config_root":{},"five_hour":{},"seven_day":{},"updated_at":{}}}"#,
+        serde_json::to_string(&info.config_root).unwrap_or_else(|_| "\"\"".to_string()),
         window_json(
             info.five_hour_pct,
             info.five_hour_resets_at,
@@ -122,8 +126,32 @@ fn window_json(pct: Option<f64>, resets_at: Option<u64>, window_minutes: Option<
     }
 }
 
-fn codex_cache_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("abtop").join(CODEX_CACHE_FILE))
+fn codex_cache_path(config_root: &Path) -> Option<PathBuf> {
+    let cache_dir = dirs::cache_dir()?.join("abtop");
+    let label = config_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("codex")
+        .trim_start_matches('.')
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    Some(cache_dir.join(format!("codex-rate-limits-{label}.json")))
+}
+
+fn expand_abbreviated_home(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
 }
 
 fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
@@ -143,6 +171,7 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
 
     Some(RateLimitInfo {
         source,
+        config_root: file.config_root,
         five_hour_pct: file.five_hour.as_ref().map(|w| w.used_percentage),
         five_hour_resets_at: file.five_hour.as_ref().map(|w| w.resets_at),
         five_hour_window_minutes: file
@@ -159,4 +188,19 @@ fn read_rate_file(path: &Path, default_source: &str) -> Option<RateLimitInfo> {
             .or(file.seven_day.as_ref().map(|_| 10_080)),
         updated_at: file.updated_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_cache_paths_are_profile_specific() {
+        let first = codex_cache_path(Path::new("/Users/test/.codex-2001")).unwrap();
+        let second = codex_cache_path(Path::new("/Users/test/.codex-3001")).unwrap();
+
+        assert_ne!(first, second);
+        assert!(first.ends_with("codex-rate-limits-codex-2001.json"));
+        assert!(second.ends_with("codex-rate-limits-codex-3001.json"));
+    }
 }

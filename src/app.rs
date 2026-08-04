@@ -167,10 +167,23 @@ impl App {
         panels: crate::config::PanelVisibility,
         claude_config_dirs: &[PathBuf],
     ) -> Self {
+        Self::new_with_config_dirs(theme, hidden_agents, panels, claude_config_dirs, &[])
+    }
+
+    pub fn new_with_config_dirs(
+        theme: Theme,
+        hidden_agents: &[String],
+        panels: crate::config::PanelVisibility,
+        claude_config_dirs: &[PathBuf],
+        codex_config_dirs: &[PathBuf],
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let summaries = load_summary_cache();
-        let mut collector =
-            MultiCollector::with_hidden_and_claude_config_dirs(hidden_agents, claude_config_dirs);
+        let mut collector = MultiCollector::with_hidden_and_config_dirs(
+            hidden_agents,
+            claude_config_dirs,
+            codex_config_dirs,
+        );
         collector.set_mcp_suppress(true);
         Self {
             sessions: Vec::new(),
@@ -976,9 +989,9 @@ fn save_summary_cache(summaries: &HashMap<String, String>) {
 /// before the account actually blocks.
 const RATE_LIMITED_PCT: f64 = 90.0;
 
-/// Promote Waiting sessions to RateLimited when a rate limit from the SAME
-/// agent CLI is over `RATE_LIMITED_PCT`. Matching on source avoids a
-/// Claude-only saturation freezing Codex sessions and vice versa.
+/// Promote Waiting sessions to RateLimited when a rate limit from the same
+/// agent CLI and auth/config root is over `RATE_LIMITED_PCT`. Empty roots are
+/// legacy data and retain the old source-wide fallback behavior.
 fn promote_waiting_to_rate_limited(sessions: &mut [AgentSession], rate_limits: &[RateLimitInfo]) {
     if rate_limits.is_empty() {
         return;
@@ -989,6 +1002,9 @@ fn promote_waiting_to_rate_limited(sessions: &mut [AgentSession], rate_limits: &
         }
         let over = rate_limits.iter().any(|rl| {
             rl.source == s.agent_cli
+                && (rl.config_root.is_empty()
+                    || s.config_root.is_empty()
+                    || rl.config_root == s.config_root)
                 && (rl.five_hour_pct.unwrap_or(0.0) > RATE_LIMITED_PCT
                     || rl.seven_day_pct.unwrap_or(0.0) > RATE_LIMITED_PCT)
         });
@@ -1058,6 +1074,7 @@ mod tests {
     fn rate_limit(source: &str, pct: f64) -> RateLimitInfo {
         RateLimitInfo {
             source: source.to_string(),
+            config_root: String::new(),
             five_hour_pct: Some(pct),
             five_hour_resets_at: None,
             five_hour_window_minutes: Some(300),
@@ -1085,6 +1102,22 @@ mod tests {
         let limits = vec![rate_limit("claude", 89.9)];
         promote_waiting_to_rate_limited(&mut sessions, &limits);
         assert_eq!(sessions[0].status, SessionStatus::Waiting);
+    }
+
+    #[test]
+    fn test_rate_limited_promotion_is_per_auth_profile() {
+        let mut first = waiting_session("codex");
+        first.config_root = "~/.codex-2001".to_string();
+        let mut second = waiting_session("codex");
+        second.config_root = "~/.codex-3001".to_string();
+        let mut saturated = rate_limit("codex", 95.0);
+        saturated.config_root = "~/.codex-2001".to_string();
+
+        let mut sessions = vec![first, second];
+        promote_waiting_to_rate_limited(&mut sessions, &[saturated]);
+
+        assert_eq!(sessions[0].status, SessionStatus::RateLimited);
+        assert_eq!(sessions[1].status, SessionStatus::Waiting);
     }
 
     #[test]

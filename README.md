@@ -131,6 +131,9 @@ hidden_agents = ["codex"]
 # abtop also auto-discovers ~/.claude and ~/.claude-* roots that contain
 # both sessions/ and projects/.
 claude_config_dirs = ["~/.claude-personal", "~/.claude-work-team"]
+# Additional Codex profile roots to scan.
+# abtop also auto-discovers ~/.codex and ~/.codex-* roots that contain sessions/.
+codex_config_dirs = ["~/.codex-personal", "~/.codex-work-team"]
 # UI language. Omit or leave empty to auto-detect from LANG.
 language = "zh"
 ```
@@ -178,8 +181,9 @@ use abtop::app::App;
 use abtop::{config, theme::Theme};
 
 let cfg = config::load_config();
-let mut app = App::new_with_config_and_claude_dirs(
-    Theme::default(), &cfg.hidden_agents, cfg.panels, &cfg.claude_config_dirs,
+let mut app = App::new_with_config_dirs(
+    Theme::default(), &cfg.hidden_agents, cfg.panels,
+    &cfg.claude_config_dirs, &cfg.codex_config_dirs,
 );
 app.tick_no_summaries();
 let json = serde_json::to_string(&app.to_snapshot(2_000)).unwrap();

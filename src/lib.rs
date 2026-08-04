@@ -36,11 +36,12 @@
 //! use abtop::{config, theme::Theme};
 //!
 //! let cfg = config::load_config();
-//! let mut app = App::new_with_config_and_claude_dirs(
+//! let mut app = App::new_with_config_dirs(
 //!     Theme::default(),
 //!     &cfg.hidden_agents,
 //!     cfg.panels,
 //!     &cfg.claude_config_dirs,
+//!     &cfg.codex_config_dirs,
 //! );
 //! loop {
 //!     app.tick_no_summaries();                // refresh without spawning `claude --print`
@@ -80,11 +81,12 @@ use std::time::Duration;
 /// Construct a headless `App` from loaded config + theme. Shared by the
 /// `--json` and `--once` entry points.
 fn build_app(theme: theme::Theme, cfg: &config::AppConfig) -> App {
-    App::new_with_config_and_claude_dirs(
+    App::new_with_config_dirs(
         theme,
         &cfg.hidden_agents,
         cfg.panels,
         &cfg.claude_config_dirs,
+        &cfg.codex_config_dirs,
     )
 }
 
@@ -196,15 +198,7 @@ pub fn run() -> io::Result<()> {
     }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let app_result = run_app(
-        &mut terminal,
-        demo_mode,
-        initial_theme,
-        exit_on_jump,
-        &cfg.hidden_agents,
-        cfg.panels,
-        &cfg.claude_config_dirs,
-    );
+    let app_result = run_app(&mut terminal, demo_mode, initial_theme, exit_on_jump, &cfg);
 
     // Always attempt both cleanup steps regardless of app result
     let r1 = if mouse_capture {
@@ -232,15 +226,14 @@ fn run_app(
     demo_mode: bool,
     initial_theme: Option<theme::Theme>,
     exit_on_jump: bool,
-    hidden_agents: &[String],
-    panels: config::PanelVisibility,
-    claude_config_dirs: &[std::path::PathBuf],
+    cfg: &config::AppConfig,
 ) -> io::Result<()> {
-    let mut app = App::new_with_config_and_claude_dirs(
+    let mut app = App::new_with_config_dirs(
         initial_theme.unwrap_or_default(),
-        hidden_agents,
-        panels,
-        claude_config_dirs,
+        &cfg.hidden_agents,
+        cfg.panels,
+        &cfg.claude_config_dirs,
+        &cfg.codex_config_dirs,
     );
     if demo_mode {
         demo::populate_demo(&mut app);
