@@ -16,6 +16,10 @@ const STALE_SECS: u64 = 600;
 /// Fixed source order so columns stay stable across runs.
 const SOURCES: &[&str] = &["claude", "codex"];
 
+/// Preferred width of the account-name column in a multi-account source.
+/// Shrinks on narrow terminals; see `draw_multi_account_column`.
+const ACCOUNT_LABEL_PAD: usize = 7;
+
 pub(crate) fn draw_quota_panel(f: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     draw_quota_panel_active(f, app, area, theme, false);
 }
@@ -339,7 +343,51 @@ fn draw_multi_account_column(
             .add_modifier(Modifier::BOLD),
     ))];
 
-    for rl in limits.iter().take(max_accounts) {
+    let rows: Vec<&RateLimitInfo> = limits.iter().take(max_accounts).copied().collect();
+
+    // Build the quota spans first, then size the account-name column from
+    // whatever the panel has left over. ratatui clips the *tail* of an
+    // over-long line, so a fixed-width name column on a narrow terminal
+    // silently ate the trailing `%` of the last window instead of losing
+    // padding it did not need.
+    let row_windows: Vec<Vec<Span<'static>>> = rows
+        .iter()
+        .map(|rl| {
+            let mut spans = compact_window_spans(
+                rl.five_hour_pct,
+                rl.five_hour_window_minutes,
+                t("quota.5h"),
+                cpu_grad,
+                theme,
+            );
+            spans.extend(compact_window_spans(
+                rl.seven_day_pct,
+                rl.seven_day_window_minutes,
+                t("quota.7d"),
+                cpu_grad,
+                theme,
+            ));
+            spans
+        })
+        .collect();
+
+    let windows_w = row_windows
+        .iter()
+        .map(|spans| spans.iter().map(Span::width).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let longest_label = rows
+        .iter()
+        .map(|rl| account_profile_label(source, rl).chars().count())
+        .max()
+        .unwrap_or(0);
+    // One cell goes to the leading space; the name gets the rest, capped at
+    // the preferred pad (or the longest name, when that is wider).
+    let label_pad = (area.width as usize)
+        .saturating_sub(1 + windows_w)
+        .min(ACCOUNT_LABEL_PAD.max(longest_label));
+
+    for (rl, windows) in rows.iter().zip(row_windows) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -347,30 +395,24 @@ fn draw_multi_account_column(
         let stale = rl
             .updated_at
             .is_some_and(|timestamp| now.saturating_sub(timestamp) > STALE_SECS);
-        let mut spans = vec![Span::styled(
-            format!(" {:<7}", account_profile_label(source, rl)),
-            Style::default()
-                .fg(if stale {
-                    theme.inactive_fg
-                } else {
-                    theme.main_fg
-                })
-                .add_modifier(Modifier::BOLD),
-        )];
-        spans.extend(compact_window_spans(
-            rl.five_hour_pct,
-            rl.five_hour_window_minutes,
-            t("quota.5h"),
-            cpu_grad,
-            theme,
-        ));
-        spans.extend(compact_window_spans(
-            rl.seven_day_pct,
-            rl.seven_day_window_minutes,
-            t("quota.7d"),
-            cpu_grad,
-            theme,
-        ));
+        let mut spans = Vec::new();
+        if label_pad > 0 {
+            let label: String = account_profile_label(source, rl)
+                .chars()
+                .take(label_pad)
+                .collect();
+            spans.push(Span::styled(
+                format!(" {label:<label_pad$}"),
+                Style::default()
+                    .fg(if stale {
+                        theme.inactive_fg
+                    } else {
+                        theme.main_fg
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.extend(windows);
         lines.push(Line::from(spans));
     }
 
@@ -608,6 +650,50 @@ mod tests {
             assert!(
                 text.contains(expected),
                 "quota panel should show {expected}\n{text}"
+            );
+        }
+    }
+
+    /// Regression: a narrow panel used to clip the trailing `%` off the 7d
+    /// window ("7d  67" instead of "7d  67%") because the account-name
+    /// column was a fixed 7 cells wide regardless of the space available.
+    #[test]
+    fn narrow_multi_account_column_keeps_percent_suffix() {
+        for width in 40u16..=72 {
+            let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+            app.rate_limits = [
+                ("claude", "~/.claude-alex", 29.0),
+                ("claude", "~/.claude-chi", 41.0),
+                ("codex", "~/.codex-2001", 49.0),
+                ("codex", "~/.codex-3001", 41.0),
+            ]
+            .into_iter()
+            .map(|(source, config_root, used)| RateLimitInfo {
+                source: source.to_string(),
+                config_root: config_root.to_string(),
+                five_hour_pct: Some(used),
+                five_hour_window_minutes: Some(300),
+                seven_day_pct: Some(used - 8.0),
+                seven_day_window_minutes: Some(10_080),
+                updated_at: Some(u64::MAX),
+                ..Default::default()
+            })
+            .collect();
+
+            let backend = TestBackend::new(width, 9);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_quota_panel(frame, &app, Rect::new(0, 0, width, 9), &app.theme);
+                })
+                .unwrap();
+            let text = format!("{}", terminal.backend());
+
+            // Two accounts per source, two sources, two windows each.
+            assert_eq!(
+                text.matches('%').count(),
+                8,
+                "every quota value keeps its % at width {width}\n{text}"
             );
         }
     }
